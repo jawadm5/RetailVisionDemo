@@ -128,6 +128,9 @@ YOLO_IOU_THRESHOLD    = float(os.environ.get("YOLO_IOU",         "0.45"))
 # Smaller defaults on CPU — increase via GPU overlay.
 MAX_BATCH_SIZE        = int(os.environ.get("YOLO_MAX_BATCH_SIZE", "4"))
 BATCH_TIMEOUT_MS      = float(os.environ.get("YOLO_BATCH_TIMEOUT_MS", "500"))
+# Idle gap that ends batch collection. Small on purpose: it only needs to
+# cover a burst already in flight, not to wait for new work.
+BATCH_DRAIN_GRACE_MS   = float(os.environ.get("YOLO_BATCH_DRAIN_GRACE_MS", "2"))
 # TRT lazy-compile: set EXPORT_TRT=true to auto-export .pt → .engine on first GPU run.
 EXPORT_TRT            = os.environ.get("EXPORT_TRT", "false").lower() == "true"
 
@@ -278,9 +281,22 @@ async def _collect_batch(pull_sock: zmq.asyncio.Socket) -> list[dict]:
     raw = await pull_sock.recv()
     batch = [msgpack.unpackb(raw, raw=False)]
 
+    # Collection ends on whichever comes first: the batch is full, the queue has
+    # been idle for BATCH_DRAIN_GRACE_MS, or BATCH_TIMEOUT_MS total has elapsed.
+    #
+    # The idle-gap condition is the important one. Callers here are strictly
+    # request/response: IEP2 sends a crop (or frame) and then blocks awaiting
+    # that specific reply, so once the in-flight messages are drained NOTHING
+    # further can arrive until we answer. Waiting for MAX_BATCH_SIZE therefore
+    # burned the entire BATCH_TIMEOUT_MS on every batch — measured at ~50 ms x
+    # ~545 batches per 60 s window, about 27 s of a 35 s ReID phase spent
+    # waiting for messages that could not come. Genuine batching still happens
+    # whenever several cameras are active, because their requests are actually
+    # concurrent and are already queued when we drain.
     deadline = time.monotonic() + BATCH_TIMEOUT_MS / 1000.0
+    grace = BATCH_DRAIN_GRACE_MS / 1000.0
     while len(batch) < MAX_BATCH_SIZE:
-        remaining = deadline - time.monotonic()
+        remaining = min(grace, deadline - time.monotonic())
         if remaining <= 0:
             break
         try:
